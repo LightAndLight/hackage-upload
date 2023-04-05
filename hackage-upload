@@ -1,0 +1,126 @@
+#! /usr/bin/env -S ipso --
+
+help : String
+help =
+  string.join 
+    "\n"
+    [
+      "usage: hackage-upload [OPTIONS] [PACKAGE]",
+      "",
+      "Arguments:",
+      "  [PACKAGE]  The name of the package to publish",
+      "",
+      "Options:",
+      "  --publish   Publish the package instead of uploading a package candidate",
+      "  --help, -h  Print help information"
+    ]
+
+getEnvironment : IO { cabal : String, ghc : String, fd : String}
+getEnvironment =
+  comp
+    bind cabal <- env.getvar! "CABAL_EXECUTABLE" 
+    bind ghc <- env.getvar! "GHC_EXECUTABLE" 
+    bind fd <- env.getvar! "FD_EXECUTABLE" 
+    io.pure { cabal = cabal, ghc = ghc, fd = fd }
+
+getTarballEntry : { fd : String, rest } -> String -> IO String
+getTarballEntry environment dir =
+  comp
+    bind dirTarballs <- cmd.lines `${environment.fd} tar.gz $dir`
+    case dirTarballs of
+      [] ->
+        comp
+          println "error: no tarballs found in $dir"
+          exit.failure
+      [tarball] ->
+        io.pure tarball
+      _ ->
+        comp
+          println "error: multiple tarballs found in $dir"
+          exit.failure
+
+filter : (a -> Bool) -> Array a -> Array a
+filter predicate =
+  array.foldl
+    (\acc value -> if predicate value then array.snoc acc value else acc)
+    []
+
+main : IO ()
+main =
+  comp
+    bind environment <- getEnvironment
+    bind args <- env.args
+
+    case filter (\arg -> arg == "--help" || arg == "-h") args of
+      [] ->
+        io.pure ()
+      _ ->
+        comp
+          println help
+          exit.success
+
+    bind publish <-
+      case filter (\arg -> arg == "--publish") args of
+        [] ->
+          io.pure false
+        _ ->
+          io.pure true
+
+    bind packageArgs <-
+      case filter (\arg -> arg != "--help" && arg != "-h" && arg != "--publish") args of
+        [] ->
+          io.pure []
+        [package] ->
+          io.pure [package]
+        _ ->
+          comp
+            println "error: expected 1 argument, got ${int.toString <| array.length args}"
+            println help
+            exit.failure
+
+    let cabalOptions = ["--with-compiler=${environment.ghc}", "--enable-tests"]
+
+    bind commit <- io.map string.trim <| cmd.read `git rev-parse HEAD`
+    
+    let distDir = "dist-$commit"
+    cmd.run `rm -rf $distDir`
+    cmd.run `mkdir -p $distDir`
+    
+    let docsDir = "dist-$commit-docs"
+    cmd.run `rm -rf $docsDir`
+    cmd.run `mkdir -p $docsDir`
+    
+    println "Compiling..."
+    cmd.run `${environment.cabal} $..cabalOptions build $..packageArgs`
+    
+    println "Running tests..."
+    cmd.run `${environment.cabal} $..cabalOptions test $..packageArgs`
+    
+    println "Generating docs..."
+    let haddockOptions = ["--builddir=$docsDir", "--haddock-for-hackage"]
+    cmd.run `${environment.cabal} $..cabalOptions haddock $..haddockOptions $..packageArgs`
+    
+    println "Checking package..."
+    cmd.run `${environment.cabal} check`
+
+    println "Generating source distribution..."
+    cmd.run `${environment.cabal} sdist -o $distDir`
+
+    print "Hackage username: "
+    bind hackageUsername <- io.map string.trim readln
+    
+    print "Hackage password: "
+    bind hackagePassword <- io.map string.trim readln
+
+    let 
+      uploadOptions =
+        ["-u", hackageUsername, "-p", hackagePassword] |>
+        (\items -> if publish then array.snoc items "--publish" else items)
+
+    bind sdistTarball <- getTarballEntry environment distDir
+    println "Uploading package${if publish then "" else " candidate"}: $sdistTarball"
+    cmd.run `${environment.cabal} upload $..uploadOptions $sdistTarball`
+    
+    bind docsTarball <- getTarballEntry environment docsDir
+    println "Uploading package${if publish then "" else " candidate"} docs: $docsTarball"
+    cmd.run `${environment.cabal} upload $..uploadOptions -d $docsTarball`
